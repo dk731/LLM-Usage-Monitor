@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::AppUsageData;
+use crate::models::{AppUsageData, Provider, PROVIDER_COUNT};
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
     WM_APP_USAGE_UPDATED,
@@ -55,21 +55,13 @@ struct AppState {
     language: LanguageId,
     install_channel: InstallChannel,
 
-    session_percent: f64,
-    session_text: String,
-    weekly_percent: f64,
-    weekly_text: String,
-    codex_session_percent: f64,
-    codex_session_text: String,
-    codex_weekly_percent: f64,
-    codex_weekly_text: String,
-    antigravity_session_percent: f64,
-    antigravity_session_text: String,
-    antigravity_weekly_percent: f64,
-    antigravity_weekly_text: String,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
+    /// Per-provider display state, indexed by `Provider::index()`.
+    session_percent: [f64; PROVIDER_COUNT],
+    session_text: [String; PROVIDER_COUNT],
+    weekly_percent: [f64; PROVIDER_COUNT],
+    weekly_text: [String; PROVIDER_COUNT],
+    show: [bool; PROVIDER_COUNT],
+    bar_segments: u32,
 
     data: Option<AppUsageData>,
 
@@ -93,6 +85,43 @@ struct AppState {
     widget_visible: bool,
 }
 
+impl AppState {
+    fn shows(&self, provider: Provider) -> bool {
+        self.show[provider.index()]
+    }
+
+    /// Providers the user has enabled, in display order.
+    fn enabled_providers(&self) -> Vec<Provider> {
+        Provider::ALL
+            .into_iter()
+            .filter(|provider| self.shows(*provider))
+            .collect()
+    }
+}
+
+/// Everything the painter needs for one provider's column.
+struct ProviderColumn {
+    provider: Provider,
+    session_percent: f64,
+    session_text: String,
+    weekly_percent: f64,
+    weekly_text: String,
+}
+
+/// Theme colours shared by every element in one repaint.
+struct Palette {
+    bg: Color,
+    text: Color,
+    track: Color,
+}
+
+/// One provider's cell within a single row (5h or 7d).
+struct RowCell<'a> {
+    provider: Provider,
+    percent: f64,
+    text: &'a str,
+}
+
 #[derive(Clone, Debug)]
 enum UpdateStatus {
     Idle,
@@ -104,12 +133,14 @@ enum UpdateStatus {
 
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
 
+const POLL_15_SEC: u32 = 15_000;
 const POLL_1_MIN: u32 = 60_000;
 const POLL_5_MIN: u32 = 300_000;
 const POLL_15_MIN: u32 = 900_000;
 const POLL_1_HOUR: u32 = 3_600_000;
 
 // Menu item IDs for update frequency
+const IDM_FREQ_15SEC: u16 = 14;
 const IDM_FREQ_1MIN: u16 = 10;
 const IDM_FREQ_5MIN: u16 = 11;
 const IDM_FREQ_15MIN: u16 = 12;
@@ -132,6 +163,16 @@ const IDM_LANG_SIMPLIFIED_CHINESE: u16 = 51;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
+const IDM_MODEL_KIMI: u16 = 63;
+const IDM_MODEL_COPILOT: u16 = 64;
+const IDM_BAR_AUTO: u16 = 70;
+const IDM_BAR_5: u16 = 71;
+const IDM_BAR_10: u16 = 72;
+const IDM_BAR_15: u16 = 73;
+const IDM_BAR_20: u16 = 74;
+
+/// Sentinel for "size the bars automatically from the provider count".
+const BAR_SEGMENTS_AUTO: u32 = 0;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -317,6 +358,32 @@ struct SettingsFile {
     show_codex: bool,
     #[serde(default = "default_show_antigravity")]
     show_antigravity: bool,
+    #[serde(default = "default_show_kimi")]
+    show_kimi: bool,
+    #[serde(default = "default_bar_segments")]
+    bar_segments: u32,
+    #[serde(default = "default_show_copilot")]
+    show_copilot: bool,
+}
+
+impl SettingsFile {
+    fn show_mask(&self) -> [bool; PROVIDER_COUNT] {
+        let mut mask = [false; PROVIDER_COUNT];
+        mask[Provider::ClaudeCode.index()] = self.show_claude_code;
+        mask[Provider::Codex.index()] = self.show_codex;
+        mask[Provider::Antigravity.index()] = self.show_antigravity;
+        mask[Provider::Kimi.index()] = self.show_kimi;
+        mask[Provider::Copilot.index()] = self.show_copilot;
+        mask
+    }
+
+    fn set_show_mask(&mut self, mask: [bool; PROVIDER_COUNT]) {
+        self.show_claude_code = mask[Provider::ClaudeCode.index()];
+        self.show_codex = mask[Provider::Codex.index()];
+        self.show_antigravity = mask[Provider::Antigravity.index()];
+        self.show_kimi = mask[Provider::Kimi.index()];
+        self.show_copilot = mask[Provider::Copilot.index()];
+    }
 }
 
 impl Default for SettingsFile {
@@ -331,6 +398,9 @@ impl Default for SettingsFile {
             show_claude_code: true,
             show_codex: false,
             show_antigravity: false,
+            show_kimi: false,
+            bar_segments: default_bar_segments(),
+            show_copilot: false,
         }
     }
 }
@@ -355,13 +425,26 @@ fn default_show_antigravity() -> bool {
     false
 }
 
+fn default_show_kimi() -> bool {
+    false
+}
+
+fn default_bar_segments() -> u32 {
+    BAR_SEGMENTS_AUTO
+}
+
+fn default_show_copilot() -> bool {
+    false
+}
+
 fn load_settings() -> SettingsFile {
     let content = match std::fs::read_to_string(settings_path()) {
         Ok(c) => c,
         Err(_) => return SettingsFile::default(),
     };
     let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
-    if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
+    // Never leave the widget with nothing to draw.
+    if !settings.show_mask().iter().any(|on| *on) {
         settings.show_claude_code = true;
     }
     settings
@@ -380,7 +463,7 @@ fn save_settings(settings: &SettingsFile) {
 fn save_state_settings() {
     let state = lock_state();
     if let Some(s) = state.as_ref() {
-        save_settings(&SettingsFile {
+        let mut settings = SettingsFile {
             tray_offset: s.tray_offset,
             taskbar_index: s.taskbar_index,
             poll_interval_ms: s.poll_interval_ms,
@@ -389,10 +472,11 @@ fn save_state_settings() {
                 .map(|language| language.code().to_string()),
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
-            show_claude_code: s.show_claude_code,
-            show_codex: s.show_codex,
-            show_antigravity: s.show_antigravity,
-        });
+            bar_segments: s.bar_segments,
+            ..SettingsFile::default()
+        };
+        settings.set_show_mask(s.show);
+        save_settings(&settings);
     }
 }
 
@@ -400,69 +484,34 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
     let state = lock_state();
     match state.as_ref() {
         Some(s) if s.last_poll_ok => {
-            let mut icons = Vec::new();
-            if s.show_claude_code {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Claude,
-                    percent: Some(s.session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().claude_code_model,
-                        s.session_text,
-                        s.weekly_text
-                    ),
-                });
-            }
-            if s.show_codex {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Codex,
-                    percent: Some(s.codex_session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().codex_model,
-                        s.codex_session_text,
-                        s.codex_weekly_text
-                    ),
-                });
-            }
-            if s.show_antigravity {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: Some(s.antigravity_session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().antigravity_model,
-                        s.antigravity_session_text,
-                        s.antigravity_weekly_text
-                    ),
-                });
-            }
-            icons
+            let strings = s.language.strings();
+            s.enabled_providers()
+                .into_iter()
+                .map(|provider| {
+                    let i = provider.index();
+                    tray_icon::TrayIconData {
+                        kind: provider_tray_kind(provider),
+                        percent: Some(s.session_percent[i]),
+                        tooltip: format!(
+                            "{} 5h: {} | 7d: {}",
+                            provider_model_label(provider, strings),
+                            s.session_text[i],
+                            s.weekly_text[i]
+                        ),
+                    }
+                })
+                .collect()
         }
         Some(s) => {
-            let mut icons = Vec::new();
-            if s.show_claude_code {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Claude,
+            let strings = s.language.strings();
+            s.enabled_providers()
+                .into_iter()
+                .map(|provider| tray_icon::TrayIconData {
+                    kind: provider_tray_kind(provider),
                     percent: None,
-                    tooltip: s.language.strings().window_title.to_string(),
-                });
-            }
-            if s.show_codex {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Codex,
-                    percent: None,
-                    tooltip: s.language.strings().codex_window_title.to_string(),
-                });
-            }
-            if s.show_antigravity {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: None,
-                    tooltip: s.language.strings().antigravity_window_title.to_string(),
-                });
-            }
-            icons
+                    tooltip: provider_window_title(provider, strings).to_string(),
+                })
+                .collect()
         }
         None => Vec::new(),
     }
@@ -645,33 +694,29 @@ fn refresh_usage_texts(state: &mut AppState) {
         return;
     };
 
-    if let Some(claude_code) = data.claude_code.as_ref() {
-        state.session_text = poller::format_line(&claude_code.session, strings);
-        state.weekly_text = poller::format_line(&claude_code.weekly, strings);
-    } else if state.show_claude_code {
-        state.session_text = "!".to_string();
-        state.weekly_text = "!".to_string();
-    }
-
-    if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_line(&codex.session, strings);
-        state.codex_weekly_text = poller::format_line(&codex.weekly, strings);
-    } else if state.show_codex {
-        state.codex_session_text = "!".to_string();
-        state.codex_weekly_text = "!".to_string();
-    }
-
-    if let Some(antigravity) = data.antigravity.as_ref() {
-        state.antigravity_session_text = poller::format_line(&antigravity.session, strings);
-        state.antigravity_weekly_text =
-            if antigravity.weekly.resets_at.is_none() && antigravity.weekly.percentage == 0.0 {
-                "--".to_string()
-            } else {
-                poller::format_line(&antigravity.weekly, strings)
-            };
-    } else if state.show_antigravity {
-        state.antigravity_session_text = "!".to_string();
-        state.antigravity_weekly_text = "!".to_string();
+    for provider in Provider::ALL {
+        let i = provider.index();
+        match data.get(provider) {
+            Some(usage) => {
+                state.session_text[i] = poller::format_line(&usage.session, strings);
+                // Antigravity and Kimi can both report a window that the
+                // account simply does not have; show it as absent rather than
+                // as a real zero.
+                state.weekly_text[i] = if usage.weekly.resets_at.is_none()
+                    && usage.weekly.percentage == 0.0
+                    && matches!(provider, Provider::Antigravity | Provider::Kimi)
+                {
+                    "--".to_string()
+                } else {
+                    poller::format_line(&usage.weekly, strings)
+                };
+            }
+            None if state.shows(provider) => {
+                state.session_text[i] = "!".to_string();
+                state.weekly_text[i] = "!".to_string();
+            }
+            None => {}
+        }
     }
 }
 
@@ -1080,11 +1125,120 @@ fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
     }
 }
 
-fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
-    (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
+fn provider_for_menu_id(id: u16) -> Option<Provider> {
+    match id {
+        IDM_MODEL_CLAUDE_CODE => Some(Provider::ClaudeCode),
+        IDM_MODEL_CODEX => Some(Provider::Codex),
+        IDM_MODEL_ANTIGRAVITY => Some(Provider::Antigravity),
+        IDM_MODEL_KIMI => Some(Provider::Kimi),
+        IDM_MODEL_COPILOT => Some(Provider::Copilot),
+        _ => None,
+    }
 }
 
-fn row_bar_segment_count(active_models: i32) -> i32 {
+fn provider_menu_id(provider: Provider) -> u16 {
+    match provider {
+        Provider::ClaudeCode => IDM_MODEL_CLAUDE_CODE,
+        Provider::Codex => IDM_MODEL_CODEX,
+        Provider::Antigravity => IDM_MODEL_ANTIGRAVITY,
+        Provider::Kimi => IDM_MODEL_KIMI,
+        Provider::Copilot => IDM_MODEL_COPILOT,
+    }
+}
+
+/// The enabled-provider mask representing "Antigravity, and nothing else".
+fn antigravity_only_mask() -> [bool; PROVIDER_COUNT] {
+    let mut mask = [false; PROVIDER_COUNT];
+    mask[Provider::Antigravity.index()] = true;
+    mask
+}
+
+fn active_model_count(show: [bool; PROVIDER_COUNT]) -> i32 {
+    (show.iter().filter(|on| **on).count() as i32).max(1)
+}
+
+fn provider_accent_color(provider: Provider, is_dark: bool) -> Color {
+    match provider {
+        Provider::ClaudeCode => claude_accent_color(),
+        Provider::Codex => codex_accent_color(is_dark),
+        Provider::Antigravity => antigravity_accent_color(),
+        Provider::Kimi => kimi_accent_color(),
+        Provider::Copilot => copilot_accent_color(is_dark),
+    }
+}
+
+fn provider_usage_text_color(provider: Provider, is_dark: bool) -> Color {
+    match provider {
+        Provider::ClaudeCode => claude_usage_text_color(is_dark),
+        Provider::Codex => codex_usage_text_color(is_dark),
+        Provider::Antigravity => antigravity_usage_text_color(is_dark),
+        Provider::Kimi => kimi_usage_text_color(is_dark),
+        Provider::Copilot => copilot_usage_text_color(is_dark),
+    }
+}
+
+fn provider_tray_kind(provider: Provider) -> tray_icon::TrayIconKind {
+    match provider {
+        Provider::ClaudeCode => tray_icon::TrayIconKind::Claude,
+        Provider::Codex => tray_icon::TrayIconKind::Codex,
+        Provider::Antigravity => tray_icon::TrayIconKind::Antigravity,
+        Provider::Kimi => tray_icon::TrayIconKind::Kimi,
+        Provider::Copilot => tray_icon::TrayIconKind::Copilot,
+    }
+}
+
+fn provider_model_label(provider: Provider, strings: Strings) -> &'static str {
+    match provider {
+        Provider::ClaudeCode => strings.claude_code_model,
+        Provider::Codex => strings.codex_model,
+        Provider::Antigravity => strings.antigravity_model,
+        Provider::Kimi => strings.kimi_model,
+        Provider::Copilot => strings.copilot_model,
+    }
+}
+
+fn provider_token_expired_strings(
+    provider: Provider,
+    strings: Strings,
+) -> (&'static str, &'static str) {
+    match provider {
+        Provider::ClaudeCode => (strings.token_expired_title, strings.token_expired_body),
+        Provider::Codex => (
+            strings.codex_token_expired_title,
+            strings.codex_token_expired_body,
+        ),
+        Provider::Antigravity => (
+            strings.antigravity_token_expired_title,
+            strings.antigravity_token_expired_body,
+        ),
+        Provider::Kimi => (
+            strings.kimi_token_expired_title,
+            strings.kimi_token_expired_body,
+        ),
+        Provider::Copilot => (
+            strings.copilot_token_expired_title,
+            strings.copilot_token_expired_body,
+        ),
+    }
+}
+
+fn provider_window_title(provider: Provider, strings: Strings) -> &'static str {
+    match provider {
+        Provider::ClaudeCode => strings.window_title,
+        Provider::Codex => strings.codex_window_title,
+        Provider::Antigravity => strings.antigravity_window_title,
+        Provider::Kimi => strings.kimi_window_title,
+        Provider::Copilot => strings.copilot_window_title,
+    }
+}
+
+/// `bar_segments` is the user's Bar Length setting: `BAR_SEGMENTS_AUTO`
+/// shrinks the bars as more providers are shown, anything else is a fixed
+/// segment count applied to every provider.
+fn row_bar_segment_count(active_models: i32, bar_segments: u32) -> i32 {
+    if bar_segments != BAR_SEGMENTS_AUTO {
+        return bar_segments as i32;
+    }
     match active_models {
         1 => SEGMENT_COUNT,
         2 => 5,
@@ -1092,8 +1246,8 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
     }
 }
 
-fn total_widget_width_for(active_models: i32) -> i32 {
-    let bar_segments = row_bar_segment_count(active_models);
+fn total_widget_width_for(active_models: i32, bar_segments_setting: u32) -> i32 {
+    let bar_segments = row_bar_segment_count(active_models, bar_segments_setting);
     let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
         + sc(BAR_RIGHT_MARGIN)
         + sc(TEXT_WIDTH);
@@ -1108,22 +1262,18 @@ fn total_widget_width_for(active_models: i32) -> i32 {
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(
-        state.show_claude_code,
-        state.show_codex,
-        state.show_antigravity,
-    ))
+    total_widget_width_for(active_model_count(state.show), state.bar_segments)
 }
 
 fn total_widget_width() -> i32 {
-    let active_models = {
+    let (active_models, bar_segments) = {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
-            .unwrap_or(1)
+            .map(|s| (active_model_count(s.show), s.bar_segments))
+            .unwrap_or((1, BAR_SEGMENTS_AUTO))
     };
-    total_widget_width_for(active_models)
+    total_widget_width_for(active_models, bar_segments)
 }
 
 fn claude_accent_color() -> Color {
@@ -1163,6 +1313,34 @@ fn antigravity_usage_text_color(is_dark: bool) -> Color {
         Color::from_hex("#8AB4F8")
     } else {
         Color::from_hex("#1967D2")
+    }
+}
+
+fn kimi_accent_color() -> Color {
+    Color::from_hex("#6E56CF")
+}
+
+fn kimi_usage_text_color(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_hex("#B4A0F5")
+    } else {
+        Color::from_hex("#5A43B0")
+    }
+}
+
+fn copilot_accent_color(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_hex("#3FB950")
+    } else {
+        Color::from_hex("#1A7F37")
+    }
+}
+
+fn copilot_usage_text_color(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_hex("#56D364")
+    } else {
+        Color::from_hex("#1A7F37")
     }
 }
 
@@ -1241,11 +1419,8 @@ pub fn run() {
 
         // Create as layered popup (will be reparented into taskbar)
         let title = native_interop::wide_str(language.strings().window_title);
-        let initial_model_count = active_model_count(
-            settings.show_claude_code,
-            settings.show_codex,
-            settings.show_antigravity,
-        );
+        let initial_model_count = active_model_count(settings.show_mask());
+        let initial_bar_segments = settings.bar_segments;
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             PCWSTR::from_raw(class_name.as_ptr()),
@@ -1253,7 +1428,7 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count),
+            total_widget_width_for(initial_model_count, initial_bar_segments),
             sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -1296,21 +1471,12 @@ pub fn run() {
                 language_override,
                 language,
                 install_channel,
-                session_percent: 0.0,
-                session_text: "--".to_string(),
-                weekly_percent: 0.0,
-                weekly_text: "--".to_string(),
-                codex_session_percent: 0.0,
-                codex_session_text: "--".to_string(),
-                codex_weekly_percent: 0.0,
-                codex_weekly_text: "--".to_string(),
-                antigravity_session_percent: 0.0,
-                antigravity_session_text: "--".to_string(),
-                antigravity_weekly_percent: 0.0,
-                antigravity_weekly_text: "--".to_string(),
-                show_claude_code: settings.show_claude_code,
-                show_codex: settings.show_codex,
-                show_antigravity: settings.show_antigravity,
+                session_percent: [0.0; PROVIDER_COUNT],
+                session_text: std::array::from_fn(|_| "--".to_string()),
+                weekly_percent: [0.0; PROVIDER_COUNT],
+                weekly_text: std::array::from_fn(|_| "--".to_string()),
+                show: settings.show_mask(),
+                bar_segments: settings.bar_segments,
                 data: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
@@ -1416,27 +1582,7 @@ pub fn run() {
 /// ClearType sub-pixel font rendering can be used for crisp, OS-native text.
 fn render_layered() {
     refresh_dpi();
-    let (
-        hwnd_val,
-        is_dark,
-        embedded,
-        strings,
-        session_pct,
-        session_text,
-        weekly_pct,
-        weekly_text,
-        codex_session_pct,
-        codex_session_text,
-        codex_weekly_pct,
-        codex_weekly_text,
-        antigravity_session_pct,
-        antigravity_session_text,
-        antigravity_weekly_pct,
-        antigravity_weekly_text,
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-    ) = {
+    let (hwnd_val, is_dark, embedded, strings, columns, bar_segments) = {
         let state = lock_state();
         match state.as_ref() {
             Some(s) => (
@@ -1444,21 +1590,8 @@ fn render_layered() {
                 s.is_dark,
                 s.embedded,
                 s.language.strings(),
-                s.session_percent,
-                s.session_text.clone(),
-                s.weekly_percent,
-                s.weekly_text.clone(),
-                s.codex_session_percent,
-                s.codex_session_text.clone(),
-                s.codex_weekly_percent,
-                s.codex_weekly_text.clone(),
-                s.antigravity_session_percent,
-                s.antigravity_session_text.clone(),
-                s.antigravity_weekly_percent,
-                s.antigravity_weekly_text.clone(),
-                s.show_claude_code,
-                s.show_codex,
-                s.show_antigravity,
+                provider_columns(s),
+                s.bar_segments,
             ),
             None => return,
         }
@@ -1477,24 +1610,25 @@ fn render_layered() {
     let width = total_widget_width();
     let height = sc(WIDGET_HEIGHT);
 
-    let accent = claude_accent_color();
-    let codex_accent = codex_accent_color(is_dark);
-    let antigravity_accent = antigravity_accent_color();
-    let track = if is_dark {
-        Color::from_hex("#444444")
-    } else {
-        Color::from_hex("#AAAAAA")
+    let palette = Palette {
+        track: if is_dark {
+            Color::from_hex("#444444")
+        } else {
+            Color::from_hex("#AAAAAA")
+        },
+        text: if is_dark {
+            Color::from_hex("#888888")
+        } else {
+            Color::from_hex("#404040")
+        },
+        bg: if is_dark {
+            Color::from_hex("#1C1C1C")
+        } else {
+            Color::from_hex("#F3F3F3")
+        },
     };
-    let text_color = if is_dark {
-        Color::from_hex("#888888")
-    } else {
-        Color::from_hex("#404040")
-    };
-    let bg_color = if is_dark {
-        Color::from_hex("#1C1C1C")
-    } else {
-        Color::from_hex("#F3F3F3")
-    };
+    let bg_color = palette.bg;
+    let segment_count = row_bar_segment_count((columns.len() as i32).max(1), bar_segments);
 
     unsafe {
         let screen_dc = GetDC(hwnd);
@@ -1534,28 +1668,10 @@ fn render_layered() {
             width,
             height,
             is_dark,
-            &bg_color,
-            &text_color,
-            &accent,
-            &track,
+            &palette,
             strings,
-            session_pct,
-            &session_text,
-            weekly_pct,
-            &weekly_text,
-            codex_session_pct,
-            &codex_session_text,
-            codex_weekly_pct,
-            &codex_weekly_text,
-            antigravity_session_pct,
-            &antigravity_session_text,
-            antigravity_weekly_pct,
-            &antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            &codex_accent,
-            &antigravity_accent,
+            &columns,
+            segment_count,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -1605,34 +1721,37 @@ fn render_layered() {
 }
 
 /// Paint all widget content onto a DC with a given background color.
+/// Snapshot the enabled providers' display state, in column order.
+fn provider_columns(state: &AppState) -> Vec<ProviderColumn> {
+    state
+        .enabled_providers()
+        .into_iter()
+        .map(|provider| {
+            let i = provider.index();
+            ProviderColumn {
+                provider,
+                session_percent: state.session_percent[i],
+                session_text: state.session_text[i].clone(),
+                weekly_percent: state.weekly_percent[i],
+                weekly_text: state.weekly_text[i].clone(),
+            }
+        })
+        .collect()
+}
+
 fn paint_content(
     hdc: HDC,
     width: i32,
     height: i32,
     is_dark: bool,
-    bg: &Color,
-    text_color: &Color,
-    accent: &Color,
-    track: &Color,
+    palette: &Palette,
     strings: Strings,
-    session_pct: f64,
-    session_text: &str,
-    weekly_pct: f64,
-    weekly_text: &str,
-    codex_session_pct: f64,
-    codex_session_text: &str,
-    codex_weekly_pct: f64,
-    codex_weekly_text: &str,
-    antigravity_session_pct: f64,
-    antigravity_session_text: &str,
-    antigravity_weekly_pct: f64,
-    antigravity_weekly_text: &str,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    codex_accent: &Color,
-    antigravity_accent: &Color,
+    columns: &[ProviderColumn],
+    segment_count: i32,
 ) {
+    let bg = &palette.bg;
+    let text_color = &palette.text;
+    let track = &palette.track;
     unsafe {
         let client_rect = RECT {
             left: 0,
@@ -1708,6 +1827,23 @@ fn paint_content(
         );
         let old_font = SelectObject(hdc, font);
 
+        let session_cells: Vec<RowCell> = columns
+            .iter()
+            .map(|column| RowCell {
+                provider: column.provider,
+                percent: column.session_percent,
+                text: &column.session_text,
+            })
+            .collect();
+        let weekly_cells: Vec<RowCell> = columns
+            .iter()
+            .map(|column| RowCell {
+                provider: column.provider,
+                percent: column.weekly_percent,
+                text: &column.weekly_text,
+            })
+            .collect();
+
         draw_row(
             hdc,
             content_x,
@@ -1715,19 +1851,9 @@ fn paint_content(
             is_dark,
             text_color,
             strings.session_window,
-            session_pct,
-            session_text,
-            codex_session_pct,
-            codex_session_text,
-            antigravity_session_pct,
-            antigravity_session_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            accent,
-            codex_accent,
-            antigravity_accent,
+            &session_cells,
             track,
+            segment_count,
         );
         draw_row(
             hdc,
@@ -1736,19 +1862,9 @@ fn paint_content(
             is_dark,
             text_color,
             strings.weekly_window,
-            weekly_pct,
-            weekly_text,
-            codex_weekly_pct,
-            codex_weekly_text,
-            antigravity_weekly_pct,
-            antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            accent,
-            codex_accent,
-            antigravity_accent,
+            &weekly_cells,
             track,
+            segment_count,
         );
 
         SelectObject(hdc, old_font);
@@ -1758,38 +1874,32 @@ fn paint_content(
 
 fn do_poll(send_hwnd: SendHwnd) {
     let hwnd = send_hwnd.to_hwnd();
-    let (show_claude_code, show_codex, show_antigravity) = {
+    let show = {
         let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| (s.show_claude_code, s.show_codex, s.show_antigravity))
-            .unwrap_or((true, false, false))
+        state.as_ref().map(|s| s.show).unwrap_or_else(|| {
+            let mut fallback = [false; PROVIDER_COUNT];
+            fallback[Provider::ClaudeCode.index()] = true;
+            fallback
+        })
     };
 
-    match poller::poll(show_claude_code, show_codex, show_antigravity) {
+    match poller::poll(show) {
         Ok(data) => {
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
-                if let Some(claude_code) = data.claude_code.as_ref() {
-                    s.session_percent = claude_code.session.percentage;
-                    s.weekly_percent = claude_code.weekly.percentage;
-                } else if s.show_claude_code {
-                    s.session_percent = 0.0;
-                    s.weekly_percent = 0.0;
-                }
-                if let Some(codex) = data.codex.as_ref() {
-                    s.codex_session_percent = codex.session.percentage;
-                    s.codex_weekly_percent = codex.weekly.percentage;
-                } else if s.show_codex {
-                    s.codex_session_percent = 0.0;
-                    s.codex_weekly_percent = 0.0;
-                }
-                if let Some(antigravity) = data.antigravity.as_ref() {
-                    s.antigravity_session_percent = antigravity.session.percentage;
-                    s.antigravity_weekly_percent = antigravity.weekly.percentage;
-                } else if s.show_antigravity {
-                    s.antigravity_session_percent = 0.0;
-                    s.antigravity_weekly_percent = 0.0;
+                for provider in Provider::ALL {
+                    let i = provider.index();
+                    match data.get(provider) {
+                        Some(usage) => {
+                            s.session_percent[i] = usage.session.percentage;
+                            s.weekly_percent[i] = usage.weekly.percentage;
+                        }
+                        None if s.shows(provider) => {
+                            s.session_percent[i] = 0.0;
+                            s.weekly_percent[i] = 0.0;
+                        }
+                        None => {}
+                    }
                 }
                 // Stop fast-poll if reset data is now fresh
                 if !poller::app_is_past_reset(&data) {
@@ -1822,8 +1932,11 @@ fn do_poll(send_hwnd: SendHwnd) {
         }
         Err(e) => {
             let auth_watch = match e {
+                // Antigravity keeps its credentials in the Windows credential
+                // store, so it needs its own watch mode — but only when it is
+                // the sole enabled provider and therefore the sole cause.
                 poller::PollError::AuthRequired | poller::PollError::TokenExpired
-                    if show_antigravity && !show_claude_code && !show_codex =>
+                    if show == antigravity_only_mask() =>
                 {
                     Some((
                         poller::CredentialWatchMode::Antigravity,
@@ -1856,12 +1969,10 @@ fn do_poll(send_hwnd: SendHwnd) {
                             s.auth_error_paused_polling = true;
                             s.auth_watch_mode = watch_mode;
                             s.auth_watch_snapshot = watch_snapshot;
-                            s.session_text = "!".to_string();
-                            s.weekly_text = "!".to_string();
-                            s.codex_session_text = "!".to_string();
-                            s.codex_weekly_text = "!".to_string();
-                            s.antigravity_session_text = "!".to_string();
-                            s.antigravity_weekly_text = "!".to_string();
+                            for i in 0..PROVIDER_COUNT {
+                                s.session_text[i] = "!".to_string();
+                                s.weekly_text[i] = "!".to_string();
+                            }
                             s.retry_count = s.retry_count.saturating_add(1);
                             unsafe {
                                 let _ = KillTimer(hwnd, TIMER_POLL);
@@ -1876,12 +1987,10 @@ fn do_poll(send_hwnd: SendHwnd) {
                             s.auth_error_paused_polling = false;
                             s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
                             s.auth_watch_snapshot.clear();
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
-                            s.antigravity_session_text = "...".to_string();
-                            s.antigravity_weekly_text = "...".to_string();
+                            for i in 0..PROVIDER_COUNT {
+                                s.session_text[i] = "...".to_string();
+                                s.weekly_text[i] = "...".to_string();
+                            }
                             s.retry_count = s.retry_count.saturating_add(1);
                             let backoff = RETRY_BASE_MS.saturating_mul(
                                 1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX),
@@ -1901,28 +2010,17 @@ fn do_poll(send_hwnd: SendHwnd) {
                 let balloon = {
                     let state = lock_state();
                     state.as_ref().map(|s| {
-                        if s.show_claude_code {
-                            (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Claude,
-                                s.language.strings().token_expired_title,
-                                s.language.strings().token_expired_body,
-                            )
-                        } else if s.show_codex {
-                            (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Codex,
-                                s.language.strings().codex_token_expired_title,
-                                s.language.strings().codex_token_expired_body,
-                            )
-                        } else {
-                            (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Antigravity,
-                                s.language.strings().antigravity_token_expired_title,
-                                s.language.strings().antigravity_token_expired_body,
-                            )
-                        }
+                        // Attribute the balloon to the first enabled provider;
+                        // with several enabled the poll error is not
+                        // attributable to any one of them.
+                        let provider = s
+                            .enabled_providers()
+                            .first()
+                            .copied()
+                            .unwrap_or(Provider::ClaudeCode);
+                        let strings = s.language.strings();
+                        let (title, body) = provider_token_expired_strings(provider, strings);
+                        (strings, provider_tray_kind(provider), title, body)
                     })
                 };
                 if let Some((_strings, kind, title, body)) = balloon {
@@ -1965,27 +2063,18 @@ fn schedule_countdown_timer() {
         }
     }
 
-    let delays = [
-        data.claude_code
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.claude_code
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
-        data.codex
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.codex
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
-        data.antigravity
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.antigravity
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
-    ];
-    let min_delay = delays.into_iter().flatten().min();
+    // Wake up exactly when the soonest countdown text would change.
+    let min_delay = Provider::ALL
+        .into_iter()
+        .filter_map(|provider| data.get(provider))
+        .flat_map(|usage| {
+            [
+                poller::time_until_display_change(usage.session.resets_at),
+                poller::time_until_display_change(usage.weekly.resets_at),
+            ]
+        })
+        .flatten()
+        .min();
 
     let ms = min_delay
         .unwrap_or(Duration::from_secs(60))
@@ -2509,10 +2598,10 @@ unsafe extern "system" fn wnd_proc(
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
+                            for i in 0..PROVIDER_COUNT {
+                                s.session_text[i] = "...".to_string();
+                                s.weekly_text[i] = "...".to_string();
+                            }
                             s.force_notify_auth_error = true;
                         }
                     }
@@ -2577,8 +2666,13 @@ unsafe extern "system" fn wnd_proc(
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
                 }
-                IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
+                IDM_FREQ_15SEC
+                | IDM_FREQ_1MIN
+                | IDM_FREQ_5MIN
+                | IDM_FREQ_15MIN
+                | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
+                        IDM_FREQ_15SEC => POLL_15_SEC,
                         IDM_FREQ_1MIN => POLL_1_MIN,
                         IDM_FREQ_5MIN => POLL_5_MIN,
                         IDM_FREQ_15MIN => POLL_15_MIN,
@@ -2595,34 +2689,48 @@ unsafe extern "system" fn wnd_proc(
                     // Reset the poll timer with the new interval
                     SetTimer(hwnd, TIMER_POLL, new_interval, None);
                 }
-                IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
+                IDM_BAR_AUTO | IDM_BAR_5 | IDM_BAR_10 | IDM_BAR_15 | IDM_BAR_20 => {
+                    let new_segments = match id {
+                        IDM_BAR_5 => 5,
+                        IDM_BAR_10 => 10,
+                        IDM_BAR_15 => 15,
+                        IDM_BAR_20 => 20,
+                        _ => BAR_SEGMENTS_AUTO,
+                    };
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            match id {
-                                IDM_MODEL_CLAUDE_CODE => {
-                                    if s.show_codex || s.show_antigravity || !s.show_claude_code {
-                                        s.show_claude_code = !s.show_claude_code;
-                                    }
+                            s.bar_segments = new_segments;
+                        }
+                    }
+                    save_state_settings();
+                    // The widget changes width, so it has to be repositioned
+                    // before the repaint.
+                    position_at_taskbar();
+                    render_layered();
+                }
+                IDM_MODEL_CLAUDE_CODE
+                | IDM_MODEL_CODEX
+                | IDM_MODEL_ANTIGRAVITY
+                | IDM_MODEL_KIMI
+                | IDM_MODEL_COPILOT => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            if let Some(provider) = provider_for_menu_id(id) {
+                                let i = provider.index();
+                                // Refuse to turn off the last enabled provider,
+                                // which would leave the widget blank.
+                                let is_last_enabled =
+                                    s.show[i] && active_model_count(s.show) == 1;
+                                if !is_last_enabled {
+                                    s.show[i] = !s.show[i];
                                 }
-                                IDM_MODEL_CODEX => {
-                                    if s.show_claude_code || s.show_antigravity || !s.show_codex {
-                                        s.show_codex = !s.show_codex;
-                                    }
-                                }
-                                IDM_MODEL_ANTIGRAVITY => {
-                                    if s.show_claude_code || s.show_codex || !s.show_antigravity {
-                                        s.show_antigravity = !s.show_antigravity;
-                                    }
-                                }
-                                _ => {}
                             }
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
-                            s.antigravity_session_text = "...".to_string();
-                            s.antigravity_weekly_text = "...".to_string();
+                            for i in 0..PROVIDER_COUNT {
+                                s.session_text[i] = "...".to_string();
+                                s.weekly_text[i] = "...".to_string();
+                            }
                         }
                     }
                     save_state_settings();
@@ -2715,9 +2823,8 @@ fn show_context_menu(hwnd: HWND) {
             install_channel,
             update_status,
             widget_visible,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
+            show,
+            bar_segments,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -2729,9 +2836,8 @@ fn show_context_menu(hwnd: HWND) {
                     s.install_channel,
                     s.update_status.clone(),
                     s.widget_visible,
-                    s.show_claude_code,
-                    s.show_codex,
-                    s.show_antigravity,
+                    s.show,
+                    s.bar_segments,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -2741,9 +2847,8 @@ fn show_context_menu(hwnd: HWND) {
                     InstallChannel::Portable,
                     UpdateStatus::Idle,
                     true,
-                    true,
-                    false,
-                    false,
+                    SettingsFile::default().show_mask(),
+                    default_bar_segments(),
                 ),
             }
         };
@@ -2760,7 +2865,8 @@ fn show_context_menu(hwnd: HWND) {
 
         // Update Frequency submenu
         let freq_menu = CreatePopupMenu().unwrap();
-        let freq_items: [(u16, u32, &str); 4] = [
+        let freq_items: [(u16, u32, &str); 5] = [
+            (IDM_FREQ_15SEC, POLL_15_SEC, strings.fifteen_seconds),
             (IDM_FREQ_1MIN, POLL_1_MIN, strings.one_minute),
             (IDM_FREQ_5MIN, POLL_5_MIN, strings.five_minutes),
             (IDM_FREQ_15MIN, POLL_15_MIN, strings.fifteen_minutes),
@@ -2791,44 +2897,20 @@ fn show_context_menu(hwnd: HWND) {
 
         // Models submenu
         let models_menu = CreatePopupMenu().unwrap();
-        let claude_model = native_interop::wide_str(strings.claude_code_model);
-        let claude_flags = if show_claude_code {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            claude_flags,
-            IDM_MODEL_CLAUDE_CODE as usize,
-            PCWSTR::from_raw(claude_model.as_ptr()),
-        );
-
-        let codex_model = native_interop::wide_str(strings.codex_model);
-        let codex_flags = if show_codex {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            codex_flags,
-            IDM_MODEL_CODEX as usize,
-            PCWSTR::from_raw(codex_model.as_ptr()),
-        );
-
-        let antigravity_model = native_interop::wide_str(strings.antigravity_model);
-        let antigravity_flags = if show_antigravity {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            antigravity_flags,
-            IDM_MODEL_ANTIGRAVITY as usize,
-            PCWSTR::from_raw(antigravity_model.as_ptr()),
-        );
+        for provider in Provider::ALL {
+            let label = native_interop::wide_str(provider_model_label(provider, strings));
+            let flags = if show[provider.index()] {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                models_menu,
+                flags,
+                provider_menu_id(provider) as usize,
+                PCWSTR::from_raw(label.as_ptr()),
+            );
+        }
 
         let models_label = native_interop::wide_str(strings.models);
         let _ = AppendMenuW(
@@ -2836,6 +2918,38 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             models_menu.0 as usize,
             PCWSTR::from_raw(models_label.as_ptr()),
+        );
+
+        // Bar Length submenu
+        let bar_menu = CreatePopupMenu().unwrap();
+        let bar_items: [(u16, u32, &str); 5] = [
+            (IDM_BAR_AUTO, BAR_SEGMENTS_AUTO, strings.bar_length_auto),
+            (IDM_BAR_5, 5, "5"),
+            (IDM_BAR_10, 10, "10"),
+            (IDM_BAR_15, 15, "15"),
+            (IDM_BAR_20, 20, "20"),
+        ];
+        for (id, segments, label) in bar_items {
+            let label_str = native_interop::wide_str(label);
+            let flags = if segments == bar_segments {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                bar_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+
+        let bar_label = native_interop::wide_str(strings.bar_length);
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            bar_menu.0 as usize,
+            PCWSTR::from_raw(bar_label.as_ptr()),
         );
 
         // Settings submenu
@@ -2973,68 +3087,37 @@ fn show_context_menu(hwnd: HWND) {
 
 /// Paint for non-embedded fallback (normal WM_PAINT path)
 fn paint(hdc: HDC, hwnd: HWND) {
-    let (
-        is_dark,
-        strings,
-        session_pct,
-        session_text,
-        weekly_pct,
-        weekly_text,
-        codex_session_pct,
-        codex_session_text,
-        codex_weekly_pct,
-        codex_weekly_text,
-        antigravity_session_pct,
-        antigravity_session_text,
-        antigravity_weekly_pct,
-        antigravity_weekly_text,
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-    ) = {
+    let (is_dark, strings, columns, bar_segments) = {
         let state = lock_state();
         match state.as_ref() {
             Some(s) => (
                 s.is_dark,
                 s.language.strings(),
-                s.session_percent,
-                s.session_text.clone(),
-                s.weekly_percent,
-                s.weekly_text.clone(),
-                s.codex_session_percent,
-                s.codex_session_text.clone(),
-                s.codex_weekly_percent,
-                s.codex_weekly_text.clone(),
-                s.antigravity_session_percent,
-                s.antigravity_session_text.clone(),
-                s.antigravity_weekly_percent,
-                s.antigravity_weekly_text.clone(),
-                s.show_claude_code,
-                s.show_codex,
-                s.show_antigravity,
+                provider_columns(s),
+                s.bar_segments,
             ),
             None => return,
         }
     };
 
-    let accent = claude_accent_color();
-    let codex_accent = codex_accent_color(is_dark);
-    let antigravity_accent = antigravity_accent_color();
-    let track = if is_dark {
-        Color::from_hex("#444444")
-    } else {
-        Color::from_hex("#AAAAAA")
+    let palette = Palette {
+        track: if is_dark {
+            Color::from_hex("#444444")
+        } else {
+            Color::from_hex("#AAAAAA")
+        },
+        text: if is_dark {
+            Color::from_hex("#888888")
+        } else {
+            Color::from_hex("#404040")
+        },
+        bg: if is_dark {
+            Color::from_hex("#1C1C1C")
+        } else {
+            Color::from_hex("#F3F3F3")
+        },
     };
-    let text_color = if is_dark {
-        Color::from_hex("#888888")
-    } else {
-        Color::from_hex("#404040")
-    };
-    let bg_color = if is_dark {
-        Color::from_hex("#1C1C1C")
-    } else {
-        Color::from_hex("#F3F3F3")
-    };
+    let segment_count = row_bar_segment_count((columns.len() as i32).max(1), bar_segments);
 
     unsafe {
         let mut client_rect = RECT::default();
@@ -3055,28 +3138,10 @@ fn paint(hdc: HDC, hwnd: HWND) {
             width,
             height,
             is_dark,
-            &bg_color,
-            &text_color,
-            &accent,
-            &track,
+            &palette,
             strings,
-            session_pct,
-            &session_text,
-            weekly_pct,
-            &weekly_text,
-            codex_session_pct,
-            &codex_session_text,
-            codex_weekly_pct,
-            &codex_weekly_text,
-            antigravity_session_pct,
-            &antigravity_session_text,
-            antigravity_weekly_pct,
-            &antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            &codex_accent,
-            &antigravity_accent,
+            &columns,
+            segment_count,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -3094,39 +3159,14 @@ fn draw_row(
     is_dark: bool,
     text_color: &Color,
     label: &str,
-    claude_percent: f64,
-    claude_text: &str,
-    codex_percent: f64,
-    codex_text: &str,
-    antigravity_percent: f64,
-    antigravity_text: &str,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    claude_accent: &Color,
-    codex_accent: &Color,
-    antigravity_accent: &Color,
+    cells: &[RowCell],
     track: &Color,
+    segment_count: i32,
 ) {
     let seg_h = sc(SEGMENT_H);
-    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
-    let segment_count = row_bar_segment_count(active_models);
-    let use_model_text_colors = active_models > 1;
-    let claude_value_color = if use_model_text_colors {
-        claude_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let codex_value_color = if use_model_text_colors {
-        codex_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let antigravity_value_color = if use_model_text_colors {
-        antigravity_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
+    // With a single provider the row needs no colour coding, so the usage text
+    // stays in the neutral label colour.
+    let use_model_text_colors = cells.len() > 1;
 
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -3145,46 +3185,26 @@ fn draw_row(
         );
 
         let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
-        if show_claude_code {
+        for cell in cells {
+            let accent = provider_accent_color(cell.provider, is_dark);
+            let value_color = if use_model_text_colors {
+                provider_usage_text_color(cell.provider, is_dark)
+            } else {
+                *text_color
+            };
+
             draw_usage_bar(
                 hdc,
                 model_x,
                 y,
                 segment_count,
-                claude_percent,
-                claude_text,
-                claude_accent,
+                cell.percent,
+                cell.text,
+                &accent,
                 track,
-                &claude_value_color,
+                &value_color,
             );
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_codex {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                codex_percent,
-                codex_text,
-                codex_accent,
-                track,
-                &codex_value_color,
-            );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_antigravity {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                antigravity_percent,
-                antigravity_text,
-                antigravity_accent,
-                track,
-                &antigravity_value_color,
-            );
         }
     }
 }
@@ -3292,5 +3312,51 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_bar_length_shrinks_as_providers_are_added() {
+        assert_eq!(row_bar_segment_count(1, BAR_SEGMENTS_AUTO), SEGMENT_COUNT);
+        assert_eq!(row_bar_segment_count(2, BAR_SEGMENTS_AUTO), 5);
+        assert_eq!(row_bar_segment_count(3, BAR_SEGMENTS_AUTO), 4);
+        assert_eq!(row_bar_segment_count(4, BAR_SEGMENTS_AUTO), 4);
+    }
+
+    #[test]
+    fn explicit_bar_length_ignores_provider_count() {
+        for active in 1..=PROVIDER_COUNT as i32 {
+            assert_eq!(row_bar_segment_count(active, 10), 10);
+            assert_eq!(row_bar_segment_count(active, 20), 20);
+        }
+    }
+
+    #[test]
+    fn widget_widens_with_longer_bars_and_more_providers() {
+        let auto_two = total_widget_width_for(2, BAR_SEGMENTS_AUTO);
+        let ten_two = total_widget_width_for(2, 10);
+        assert!(
+            ten_two > auto_two,
+            "10 segments should be wider than auto's 5 for two providers"
+        );
+        assert!(total_widget_width_for(2, 10) > total_widget_width_for(1, 10));
+    }
+
+    #[test]
+    fn show_mask_round_trips_through_settings() {
+        let mut settings = SettingsFile::default();
+        let mut mask = [false; PROVIDER_COUNT];
+        mask[Provider::ClaudeCode.index()] = true;
+        mask[Provider::Kimi.index()] = true;
+
+        settings.set_show_mask(mask);
+
+        assert_eq!(settings.show_mask(), mask);
+        assert!(settings.show_kimi);
+        assert!(!settings.show_codex);
     }
 }

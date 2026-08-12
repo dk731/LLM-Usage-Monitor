@@ -11,11 +11,24 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{AppUsageData, UsageData, UsageSection};
+use crate::models::{AppUsageData, Provider, UsageData, UsageSection, PROVIDER_COUNT};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const KIMI_REFRESH_URL: &str = "https://www.kimi.com/api/auth/token/refresh";
+const KIMI_STATS_URL: &str =
+    "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats";
+/// Kimi's web client sends a browser UA; the gateway rejects requests without one.
+const KIMI_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
+     Chrome/151.0.0.0 Safari/537.36";
+/// Refresh the access token this long before it actually expires.
+const KIMI_ACCESS_TOKEN_SKEW_SECS: u64 = 300;
+/// Reports credits consumed for the signed-in seat. Uses the Copilot editor's
+/// own OAuth token, so it needs no personal access token.
+const COPILOT_QUOTA_URL: &str = "https://api.github.com/copilot_internal/user";
+const COPILOT_API_VERSION: &str = "2022-11-28";
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
 const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     "https://daily-cloudcode-pa.googleapis.com",
@@ -144,6 +157,108 @@ struct AntigravityQuotaSummaryBucket {
     reset_time: Option<String>,
 }
 
+/// On-disk Kimi credentials. `refresh_token` is supplied by the user (copied
+/// from the Kimi web app's local storage); the access token is a cache that the
+/// poller maintains itself.
+#[derive(Default, Deserialize, serde::Serialize)]
+struct KimiCredentialFile {
+    #[serde(default)]
+    refresh_token: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_expires_at: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct KimiRefreshResponse {
+    access_token: String,
+    /// Kimi mints a fresh refresh token on every call. The previous one stays
+    /// valid, so persisting this is an optimisation (it rolls the 90-day
+    /// expiry forward) rather than a correctness requirement.
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KimiStatsResponse {
+    #[serde(rename = "ratelimitCode5h")]
+    ratelimit_5h: Option<KimiRateLimit>,
+    #[serde(rename = "ratelimitCode7d")]
+    ratelimit_7d: Option<KimiRateLimit>,
+}
+
+#[derive(Deserialize)]
+struct KimiRateLimit {
+    /// Fraction of the window consumed, 0.0–1.0.
+    #[serde(default)]
+    ratio: f64,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(rename = "resetTime")]
+    reset_time: Option<String>,
+}
+
+/// On-disk Copilot configuration. Only `org` and `token` are needed for the
+/// budget row; `included_credits` supplies the denominator for the credits row,
+/// which GitHub does not expose through any API.
+#[derive(Default, Deserialize)]
+struct CopilotConfigFile {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    org: String,
+    #[serde(default)]
+    included_credits: Option<f64>,
+}
+
+/// Shape of `~/AppData/Local/github-copilot/apps.json`, written by the editor
+/// extensions when you sign in to Copilot.
+#[derive(Deserialize)]
+struct CopilotAppEntry {
+    oauth_token: String,
+}
+
+#[derive(Deserialize)]
+struct CopilotQuotaResponse {
+    quota_reset_date: Option<String>,
+    quota_snapshots: Option<HashMap<String, CopilotQuotaSnapshot>>,
+}
+
+#[derive(Deserialize)]
+struct CopilotQuotaSnapshot {
+    #[serde(default)]
+    credits_used: f64,
+}
+
+#[derive(Deserialize)]
+struct CopilotBudgetsResponse {
+    #[serde(default)]
+    budgets: Vec<CopilotBudget>,
+}
+
+#[derive(Deserialize)]
+struct CopilotBudget {
+    #[serde(default)]
+    budget_product_sku: String,
+    #[serde(default)]
+    budget_amount: f64,
+}
+
+#[derive(Deserialize)]
+struct CopilotUsageResponse {
+    #[serde(rename = "usageItems", default)]
+    usage_items: Vec<CopilotUsageItem>,
+}
+
+#[derive(Deserialize)]
+struct CopilotUsageItem {
+    #[serde(default)]
+    product: String,
+    #[serde(rename = "netAmount", default)]
+    net_amount: f64,
+}
+
 #[repr(C)]
 struct CredentialW {
     flags: u32,
@@ -171,70 +286,46 @@ extern "system" {
     fn CredFree(buffer: *mut c_void);
 }
 
-pub fn poll(
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-) -> Result<AppUsageData, PollError> {
-    poll_with(
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-        poll_claude_code,
-        poll_codex,
-        poll_antigravity,
-    )
+pub fn poll(enabled: [bool; PROVIDER_COUNT]) -> Result<AppUsageData, PollError> {
+    poll_with(enabled, |provider| match provider {
+        Provider::ClaudeCode => poll_claude_code(),
+        Provider::Codex => poll_codex(),
+        Provider::Antigravity => poll_antigravity(),
+        Provider::Kimi => poll_kimi(),
+        Provider::Copilot => poll_copilot(),
+    })
 }
 
 fn poll_with(
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    mut poll_claude_code: impl FnMut() -> Result<UsageData, PollError>,
-    mut poll_codex: impl FnMut() -> Result<UsageData, PollError>,
-    mut poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
+    enabled: [bool; PROVIDER_COUNT],
+    mut poll_provider: impl FnMut(Provider) -> Result<UsageData, PollError>,
 ) -> Result<AppUsageData, PollError> {
     let mut data = AppUsageData::default();
     let mut first_error = None;
-    let active_provider_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
+    let active_provider_count = enabled.iter().filter(|on| **on).count();
 
-    if show_claude_code {
-        match poll_claude_code() {
-            Ok(claude_code) => data.claude_code = Some(claude_code),
+    for provider in Provider::ALL {
+        if !enabled[provider.index()] {
+            continue;
+        }
+
+        match poll_provider(provider) {
+            Ok(usage) => data.set(provider, usage),
             Err(error) => {
+                // With a single provider the widget surfaces the error itself,
+                // so only log when a failure would otherwise be invisible.
                 if active_provider_count > 1 {
-                    diagnose::log(format!("Claude Code usage poll failed: {error:?}"));
+                    diagnose::log(format!(
+                        "{} usage poll failed: {error:?}",
+                        provider.log_name()
+                    ));
                 }
                 first_error.get_or_insert(error);
             }
         }
     }
 
-    if show_codex {
-        match poll_codex() {
-            Ok(codex) => data.codex = Some(codex),
-            Err(error) => {
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Codex usage poll failed: {error:?}"));
-                }
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-
-    if show_antigravity {
-        match poll_antigravity() {
-            Ok(antigravity) => data.antigravity = Some(antigravity),
-            Err(error) => {
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Antigravity usage poll failed: {error:?}"));
-                }
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-
-    if data.claude_code.is_none() && data.codex.is_none() && data.antigravity.is_none() {
+    if data.is_empty() {
         Err(first_error.unwrap_or(PollError::RequestFailed))
     } else {
         Ok(data)
@@ -285,6 +376,484 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
     };
 
     fetch_antigravity_usage(&creds.access_token)
+}
+
+pub fn kimi_credentials_path() -> PathBuf {
+    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(appdata)
+        .join("ClaudeCodeUsageMonitor")
+        .join("kimi.json")
+}
+
+fn read_kimi_credentials() -> Option<KimiCredentialFile> {
+    let content = std::fs::read_to_string(kimi_credentials_path()).ok()?;
+    let creds: KimiCredentialFile = serde_json::from_str(&content).ok()?;
+    if creds.refresh_token.trim().is_empty() {
+        return None;
+    }
+    Some(creds)
+}
+
+fn write_kimi_credentials(creds: &KimiCredentialFile) {
+    let path = kimi_credentials_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_string_pretty(creds) {
+        Ok(json) => {
+            if let Err(error) = std::fs::write(&path, json) {
+                diagnose::log_error("unable to write Kimi credentials", error);
+            }
+        }
+        Err(error) => diagnose::log_error("unable to serialize Kimi credentials", error),
+    }
+}
+
+fn poll_kimi() -> Result<UsageData, PollError> {
+    let mut creds = match read_kimi_credentials() {
+        Some(creds) => creds,
+        None => {
+            diagnose::log("Kimi usage poll failed: no Kimi refresh token configured");
+            return Err(PollError::NoCredentials);
+        }
+    };
+
+    let access_token = kimi_access_token(&mut creds)?;
+
+    match fetch_kimi_usage(&access_token) {
+        Ok(data) => Ok(data),
+        // A cached access token can be revoked before its stated expiry;
+        // force one refresh before giving up.
+        Err(PollError::AuthRequired) => {
+            diagnose::log("Kimi access token rejected; forcing refresh");
+            creds.access_token.clear();
+            creds.access_expires_at = None;
+            let refreshed = kimi_access_token(&mut creds)?;
+            fetch_kimi_usage(&refreshed)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Return a usable access token, refreshing and persisting one if the cached
+/// token is missing or close to expiry.
+fn kimi_access_token(creds: &mut KimiCredentialFile) -> Result<String, PollError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let cached_is_valid = !creds.access_token.is_empty()
+        && creds
+            .access_expires_at
+            .is_some_and(|expires| expires > now + KIMI_ACCESS_TOKEN_SKEW_SECS);
+
+    if cached_is_valid {
+        return Ok(creds.access_token.clone());
+    }
+
+    let refreshed = refresh_kimi_token(&creds.refresh_token)?;
+
+    creds.access_token = refreshed.access_token.clone();
+    creds.access_expires_at = jwt_expiry(&refreshed.access_token);
+    if let Some(new_refresh) = refreshed.refresh_token.filter(|t| !t.is_empty()) {
+        creds.refresh_token = new_refresh;
+    }
+    write_kimi_credentials(creds);
+
+    Ok(refreshed.access_token)
+}
+
+fn refresh_kimi_token(refresh_token: &str) -> Result<KimiRefreshResponse, PollError> {
+    let agent = build_agent()?;
+    let resp = match agent
+        .get(KIMI_REFRESH_URL)
+        .set("Authorization", &format!("Bearer {refresh_token}"))
+        .set("User-Agent", KIMI_USER_AGENT)
+        .set("x-msh-platform", "web")
+        .call()
+    {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
+            diagnose::log(format!(
+                "Kimi refresh endpoint returned auth error status {code}; re-authentication required"
+            ));
+            return Err(PollError::TokenExpired);
+        }
+        Err(error) => {
+            diagnose::log_error("Kimi refresh endpoint request failed", error);
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    resp.into_json().map_err(|error| {
+        diagnose::log_error("unable to parse Kimi refresh response", error);
+        PollError::RequestFailed
+    })
+}
+
+fn fetch_kimi_usage(access_token: &str) -> Result<UsageData, PollError> {
+    let agent = build_agent()?;
+    let resp = match agent
+        .post(KIMI_STATS_URL)
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .set("Content-Type", "application/json")
+        .set("connect-protocol-version", "1")
+        .set("Origin", "https://www.kimi.com")
+        .set("Referer", "https://www.kimi.com/code/console")
+        .set("User-Agent", KIMI_USER_AGENT)
+        .set("x-msh-platform", "web")
+        .send_string("{}")
+    {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
+            diagnose::log(format!(
+                "Kimi usage endpoint returned auth error status {code}; refresh required"
+            ));
+            return Err(PollError::AuthRequired);
+        }
+        Err(error) => {
+            diagnose::log_error("Kimi usage endpoint request failed", error);
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    let response: KimiStatsResponse = match resp.into_json() {
+        Ok(response) => response,
+        Err(error) => {
+            diagnose::log_error("unable to parse Kimi usage response", error);
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    kimi_usage_from_response(response).ok_or(PollError::RequestFailed)
+}
+
+fn kimi_usage_from_response(response: KimiStatsResponse) -> Option<UsageData> {
+    // Both windows disabled means the account has no coding subscription, which
+    // is a different situation from a transport failure — but there is nothing
+    // meaningful to draw either way.
+    let session = response.ratelimit_5h.as_ref().map(kimi_section);
+    let weekly = response.ratelimit_7d.as_ref().map(kimi_section);
+    if session.is_none() && weekly.is_none() {
+        return None;
+    }
+
+    Some(UsageData {
+        session: session.unwrap_or_default(),
+        weekly: weekly.unwrap_or_default(),
+    })
+}
+
+fn kimi_section(limit: &KimiRateLimit) -> UsageSection {
+    UsageSection {
+        countdown_override: None,
+        // `ratio` is a 0–1 fraction of the window consumed; the widget works in
+        // percentages like every other provider.
+        percentage: if limit.enabled {
+            (limit.ratio * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        },
+        resets_at: parse_iso8601(limit.reset_time.as_deref()),
+    }
+}
+
+/// Read the `exp` claim from a JWT without verifying it. Only used to decide
+/// when to refresh, so a malformed token simply forces a refresh next poll.
+fn jwt_expiry(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64_url_decode(payload)?;
+    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    json.get("exp")?.as_u64()
+}
+
+fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+
+    for byte in input.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = TABLE.iter().position(|c| *c == byte)? as u32;
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+
+    Some(out)
+}
+
+pub fn copilot_config_path() -> PathBuf {
+    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(appdata)
+        .join("ClaudeCodeUsageMonitor")
+        .join("copilot.json")
+}
+
+fn read_copilot_config() -> CopilotConfigFile {
+    std::fs::read_to_string(copilot_config_path())
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+/// The Copilot editor extensions store an OAuth token per GitHub host. It only
+/// unlocks `copilot_internal/*`, which is all the credits row needs.
+fn read_copilot_editor_token() -> Option<String> {
+    let local = std::env::var("LOCALAPPDATA").ok()?;
+    let path = PathBuf::from(local)
+        .join("github-copilot")
+        .join("apps.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    let apps: HashMap<String, CopilotAppEntry> = serde_json::from_str(&content).ok()?;
+    apps.into_values()
+        .map(|entry| entry.oauth_token)
+        .find(|token| !token.is_empty())
+}
+
+fn poll_copilot() -> Result<UsageData, PollError> {
+    let config = read_copilot_config();
+    let mut data = UsageData::default();
+    let mut any = false;
+
+    // Credits row. Works from the editor token alone, so it stays available
+    // even when no personal access token has been configured.
+    match fetch_copilot_credits(config.included_credits) {
+        Ok(section) => {
+            data.session = section;
+            any = true;
+        }
+        Err(error) => diagnose::log(format!("Copilot credits unavailable: {error:?}")),
+    }
+
+    // Budget row. Needs a PAT with org billing read.
+    if !config.token.is_empty() && !config.org.is_empty() {
+        match fetch_copilot_budget(&config.token, &config.org) {
+            Ok(section) => {
+                data.weekly = section;
+                any = true;
+            }
+            Err(error) => diagnose::log(format!("Copilot budget unavailable: {error:?}")),
+        }
+    } else {
+        diagnose::log("Copilot budget row skipped: no token/org in copilot.json");
+    }
+
+    if any {
+        Ok(data)
+    } else {
+        Err(PollError::NoCredentials)
+    }
+}
+
+fn fetch_copilot_credits(included_credits: Option<f64>) -> Result<UsageSection, PollError> {
+    let token = match read_copilot_editor_token() {
+        Some(token) => token,
+        None => {
+            diagnose::log("Copilot poll failed: no Copilot editor credentials found");
+            return Err(PollError::NoCredentials);
+        }
+    };
+
+    let agent = build_agent()?;
+    let resp = match agent
+        .get(COPILOT_QUOTA_URL)
+        .set("Authorization", &format!("token {token}"))
+        .set("Editor-Version", "ClaudeCodeUsageMonitor/1.0")
+        .call()
+    {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
+            diagnose::log(format!(
+                "Copilot quota endpoint returned auth error status {code}"
+            ));
+            return Err(PollError::AuthRequired);
+        }
+        Err(error) => {
+            diagnose::log_error("Copilot quota endpoint request failed", error);
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    let response: CopilotQuotaResponse = match resp.into_json() {
+        Ok(response) => response,
+        Err(error) => {
+            diagnose::log_error("unable to parse Copilot quota response", error);
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    Ok(copilot_credits_section(response, included_credits))
+}
+
+fn copilot_credits_section(
+    response: CopilotQuotaResponse,
+    included_credits: Option<f64>,
+) -> UsageSection {
+    let credits_used = response
+        .quota_snapshots
+        .as_ref()
+        .and_then(|snapshots| snapshots.get("premium_interactions"))
+        .map(|snapshot| snapshot.credits_used)
+        .unwrap_or(0.0);
+
+    // GitHub exposes no included-credit allowance, so without a configured
+    // denominator show the raw credit count and leave the bar empty.
+    match included_credits.filter(|total| *total > 0.0) {
+        Some(total) => UsageSection {
+            percentage: (credits_used / total * 100.0).clamp(0.0, 100.0),
+            resets_at: parse_date_only(response.quota_reset_date.as_deref()),
+            countdown_override: None,
+        },
+        None => UsageSection {
+            percentage: 0.0,
+            resets_at: parse_date_only(response.quota_reset_date.as_deref()),
+            countdown_override: Some(format!("{credits_used:.0}cr")),
+        },
+    }
+}
+
+fn fetch_copilot_budget(token: &str, org: &str) -> Result<UsageSection, PollError> {
+    let agent = build_agent()?;
+
+    let budgets: CopilotBudgetsResponse = copilot_api_get(
+        &agent,
+        token,
+        &format!("https://api.github.com/organizations/{org}/settings/billing/budgets"),
+    )?;
+    let budget_amount = budgets
+        .budgets
+        .iter()
+        .find(|budget| budget.budget_product_sku == "copilot")
+        .map(|budget| budget.budget_amount)
+        .unwrap_or(0.0);
+
+    let (year, month) = current_year_month();
+    let usage: CopilotUsageResponse = copilot_api_get(
+        &agent,
+        token,
+        &format!(
+            "https://api.github.com/organizations/{org}/settings/billing/usage?year={year}&month={month}"
+        ),
+    )?;
+    let spend: f64 = usage
+        .usage_items
+        .iter()
+        .filter(|item| item.product == "copilot")
+        .map(|item| item.net_amount)
+        .sum();
+
+    Ok(UsageSection {
+        percentage: if budget_amount > 0.0 {
+            (spend / budget_amount * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        },
+        resets_at: next_month_start(year, month),
+        countdown_override: Some(format!("${spend:.2}")),
+    })
+}
+
+fn copilot_api_get<T: serde::de::DeserializeOwned>(
+    agent: &ureq::Agent,
+    token: &str,
+    url: &str,
+) -> Result<T, PollError> {
+    let resp = match agent
+        .get(url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/vnd.github+json")
+        .set("X-GitHub-Api-Version", COPILOT_API_VERSION)
+        .call()
+    {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
+            diagnose::log(format!(
+                "Copilot billing endpoint returned auth error status {code}; check the token's org permissions"
+            ));
+            return Err(PollError::AuthRequired);
+        }
+        Err(error) => {
+            diagnose::log_error("Copilot billing endpoint request failed", error);
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    resp.into_json().map_err(|error| {
+        diagnose::log_error("unable to parse Copilot billing response", error);
+        PollError::RequestFailed
+    })
+}
+
+/// Parse a bare `YYYY-MM-DD` date as midnight UTC.
+fn parse_date_only(value: Option<&str>) -> Option<SystemTime> {
+    let value = value?;
+    parse_iso8601(Some(&format!("{value}T00:00:00")))
+}
+
+fn current_year_month() -> (u64, u64) {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (year, month, _) = civil_from_unix(secs);
+    (year, month)
+}
+
+fn next_month_start(year: u64, month: u64) -> Option<SystemTime> {
+    let (next_year, next_month) = if month >= 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    parse_iso8601(Some(&format!("{next_year:04}-{next_month:02}-01T00:00:00")))
+}
+
+/// Convert a Unix timestamp to a civil (year, month, day) in UTC.
+fn civil_from_unix(secs: u64) -> (u64, u64, u64) {
+    let mut days = secs / 86400;
+    let mut year = 1970u64;
+    loop {
+        let year_days = if is_leap(year) { 366 } else { 365 };
+        if days < year_days {
+            break;
+        }
+        days -= year_days;
+        year += 1;
+    }
+
+    let month_lengths = [
+        31,
+        if is_leap(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1u64;
+    for length in month_lengths {
+        if days < length {
+            break;
+        }
+        days -= length;
+        month += 1;
+    }
+
+    (year, month, days + 1)
 }
 
 fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
@@ -853,6 +1422,7 @@ fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> 
 
 fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
     UsageSection {
+        countdown_override: None,
         percentage: window.used_percent,
         resets_at: unix_to_system_time(Some(window.reset_at)),
     }
@@ -1045,6 +1615,7 @@ fn fetch_antigravity_quota_summary(
 fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageSection> {
     let remaining = quota.remaining_fraction?.clamp(0.0, 1.0);
     Some(UsageSection {
+        countdown_override: None,
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(quota.reset_time.as_deref()),
     })
@@ -1055,6 +1626,7 @@ fn antigravity_section_from_summary_bucket(
 ) -> Option<UsageSection> {
     let remaining = bucket.remaining_fraction?.clamp(0.0, 1.0);
     Some(UsageSection {
+        countdown_override: None,
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(bucket.reset_time.as_deref()),
     })
@@ -1524,7 +2096,10 @@ fn is_leap(y: u64) -> bool {
 /// Format a usage section as "X% · Yh" style text
 pub fn format_line(section: &UsageSection, strings: Strings) -> String {
     let pct = format!("{:.0}%", section.percentage);
-    let cd = format_countdown(section.resets_at, strings);
+    let cd = match section.countdown_override.as_deref() {
+        Some(text) => text.to_string(),
+        None => format_countdown(section.resets_at, strings),
+    };
     if cd.is_empty() {
         pct
     } else {
@@ -1595,9 +2170,10 @@ pub fn is_past_reset(data: &UsageData) -> bool {
 }
 
 pub fn app_is_past_reset(data: &AppUsageData) -> bool {
-    data.claude_code.as_ref().is_some_and(is_past_reset)
-        || data.codex.as_ref().is_some_and(is_past_reset)
-        || data.antigravity.as_ref().is_some_and(is_past_reset)
+    Provider::ALL
+        .iter()
+        .filter_map(|provider| data.get(*provider))
+        .any(is_past_reset)
 }
 
 #[cfg(test)]
@@ -1607,6 +2183,7 @@ mod tests {
     fn usage_with_session_percent(percentage: f64) -> UsageData {
         UsageData {
             session: UsageSection {
+                countdown_override: None,
                 percentage,
                 resets_at: None,
             },
@@ -1614,47 +2191,62 @@ mod tests {
         }
     }
 
+    /// Build the enabled-provider mask from the providers that should be on.
+    fn enabled(providers: &[Provider]) -> [bool; PROVIDER_COUNT] {
+        let mut mask = [false; PROVIDER_COUNT];
+        for provider in providers {
+            mask[provider.index()] = true;
+        }
+        mask
+    }
+
     #[test]
     fn claude_failure_does_not_block_codex_when_both_are_enabled() {
         let data = poll_with(
-            true,
-            true,
-            false,
-            || Err(PollError::AuthRequired),
-            || Ok(usage_with_session_percent(42.0)),
-            || unreachable!("antigravity is disabled"),
+            enabled(&[Provider::ClaudeCode, Provider::Codex]),
+            |provider| match provider {
+                Provider::ClaudeCode => Err(PollError::AuthRequired),
+                Provider::Codex => Ok(usage_with_session_percent(42.0)),
+                other => unreachable!("{other:?} is disabled"),
+            },
         )
         .expect("codex data should keep the poll successful");
 
-        assert!(data.claude_code.is_none());
-        assert_eq!(data.codex.unwrap().session.percentage, 42.0);
+        assert!(data.get(Provider::ClaudeCode).is_none());
+        assert_eq!(
+            data.get(Provider::Codex).unwrap().session.percentage,
+            42.0
+        );
     }
 
     #[test]
     fn codex_failure_does_not_block_claude_when_both_are_enabled() {
         let data = poll_with(
-            true,
-            true,
-            false,
-            || Ok(usage_with_session_percent(64.0)),
-            || Err(PollError::RequestFailed),
-            || unreachable!("antigravity is disabled"),
+            enabled(&[Provider::ClaudeCode, Provider::Codex]),
+            |provider| match provider {
+                Provider::ClaudeCode => Ok(usage_with_session_percent(64.0)),
+                Provider::Codex => Err(PollError::RequestFailed),
+                other => unreachable!("{other:?} is disabled"),
+            },
         )
         .expect("claude data should keep the poll successful");
 
-        assert_eq!(data.claude_code.unwrap().session.percentage, 64.0);
-        assert!(data.codex.is_none());
+        assert_eq!(
+            data.get(Provider::ClaudeCode).unwrap().session.percentage,
+            64.0
+        );
+        assert!(data.get(Provider::Codex).is_none());
     }
 
     #[test]
     fn returns_first_error_when_no_enabled_provider_succeeds() {
         let error = poll_with(
-            true,
-            true,
-            true,
-            || Err(PollError::AuthRequired),
-            || Err(PollError::RequestFailed),
-            || Err(PollError::NoCredentials),
+            enabled(&[Provider::ClaudeCode, Provider::Codex, Provider::Antigravity]),
+            |provider| match provider {
+                Provider::ClaudeCode => Err(PollError::AuthRequired),
+                Provider::Codex => Err(PollError::RequestFailed),
+                _ => Err(PollError::NoCredentials),
+            },
         )
         .expect_err("all-provider failure should return an error");
 
@@ -1664,17 +2256,172 @@ mod tests {
     #[test]
     fn antigravity_failure_does_not_block_codex_when_both_are_enabled() {
         let data = poll_with(
-            false,
-            true,
-            true,
-            || unreachable!("claude code is disabled"),
-            || Ok(usage_with_session_percent(42.0)),
-            || Err(PollError::NoCredentials),
+            enabled(&[Provider::Codex, Provider::Antigravity]),
+            |provider| match provider {
+                Provider::Codex => Ok(usage_with_session_percent(42.0)),
+                Provider::Antigravity => Err(PollError::NoCredentials),
+                other => unreachable!("{other:?} is disabled"),
+            },
         )
         .expect("codex data should keep the poll successful");
 
-        assert!(data.antigravity.is_none());
-        assert_eq!(data.codex.unwrap().session.percentage, 42.0);
+        assert!(data.get(Provider::Antigravity).is_none());
+        assert_eq!(
+            data.get(Provider::Codex).unwrap().session.percentage,
+            42.0
+        );
+    }
+
+    #[test]
+    fn kimi_failure_does_not_block_claude_when_both_are_enabled() {
+        let data = poll_with(
+            enabled(&[Provider::ClaudeCode, Provider::Kimi]),
+            |provider| match provider {
+                Provider::ClaudeCode => Ok(usage_with_session_percent(10.0)),
+                Provider::Kimi => Err(PollError::NoCredentials),
+                other => unreachable!("{other:?} is disabled"),
+            },
+        )
+        .expect("claude data should keep the poll successful");
+
+        assert!(data.get(Provider::Kimi).is_none());
+        assert_eq!(
+            data.get(Provider::ClaudeCode).unwrap().session.percentage,
+            10.0
+        );
+    }
+
+    #[test]
+    fn kimi_ratios_become_percentages() {
+        let response: KimiStatsResponse = serde_json::from_str(
+            r#"{
+                "ratelimitCode5h": {
+                    "ratio": 0.5971,
+                    "enabled": true,
+                    "resetTime": "2026-08-12T19:32:28.560469934Z"
+                },
+                "ratelimitCode7d": {
+                    "ratio": 0.2246,
+                    "enabled": true,
+                    "resetTime": "2026-08-19T09:32:28.560469934Z"
+                },
+                "subscriptionBalance": { "amountUsedRatio": 0.0449 }
+            }"#,
+        )
+        .expect("stats response should deserialize");
+
+        let usage = kimi_usage_from_response(response).expect("both windows should be present");
+
+        assert!((usage.session.percentage - 59.71).abs() < 0.0001);
+        assert!((usage.weekly.percentage - 22.46).abs() < 0.0001);
+        assert!(usage.session.resets_at.is_some());
+        assert!(usage.weekly.resets_at.is_some());
+    }
+
+    #[test]
+    fn kimi_disabled_window_reports_no_usage() {
+        let response: KimiStatsResponse = serde_json::from_str(
+            r#"{
+                "ratelimitCode5h": { "ratio": 0.9, "enabled": false, "resetTime": null },
+                "ratelimitCode7d": { "ratio": 0.5, "enabled": true, "resetTime": null }
+            }"#,
+        )
+        .expect("stats response should deserialize");
+
+        let usage = kimi_usage_from_response(response).expect("windows are present");
+
+        assert_eq!(usage.session.percentage, 0.0);
+        assert!((usage.weekly.percentage - 50.0).abs() < 0.0001);
+    }
+
+    /// Live end-to-end check against the real Kimi endpoints. Requires a
+    /// configured kimi.json, so it is ignored by default:
+    ///   cargo test kimi_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn kimi_live_poll() {
+        let usage = poll_kimi().expect("live Kimi poll should succeed");
+        println!(
+            "5h: {:.2}% resets {:?}",
+            usage.session.percentage, usage.session.resets_at
+        );
+        println!(
+            "7d: {:.2}% resets {:?}",
+            usage.weekly.percentage, usage.weekly.resets_at
+        );
+        assert!(usage.session.percentage >= 0.0 && usage.session.percentage <= 100.0);
+        assert!(usage.session.resets_at.is_some() || usage.weekly.resets_at.is_some());
+    }
+
+    /// Live end-to-end check against GitHub. Requires a configured
+    /// copilot.json, so it is ignored by default:
+    ///   cargo test copilot_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn copilot_live_poll() {
+        let usage = poll_copilot().expect("live Copilot poll should succeed");
+        let strings = crate::localization::LanguageId::English.strings();
+        println!(
+            "credits row: {:.2}%  text={:?}",
+            usage.session.percentage,
+            format_line(&usage.session, strings)
+        );
+        println!(
+            "budget  row: {:.2}%  text={:?}",
+            usage.weekly.percentage,
+            format_line(&usage.weekly, strings)
+        );
+        assert!(usage.session.resets_at.is_some() || usage.weekly.resets_at.is_some());
+    }
+
+    #[test]
+    fn copilot_credits_use_configured_denominator() {
+        let json = r#"{
+            "quota_reset_date": "2026-09-01",
+            "quota_snapshots": {
+                "premium_interactions": { "credits_used": 719, "entitlement": 0 }
+            }
+        }"#;
+
+        let with_total: CopilotQuotaResponse = serde_json::from_str(json).unwrap();
+        let section = copilot_credits_section(with_total, Some(1000.0));
+        assert!((section.percentage - 71.9).abs() < 0.0001);
+        assert!(section.countdown_override.is_none());
+        assert!(section.resets_at.is_some());
+
+        // Without a denominator the bar stays empty and the raw count shows.
+        let without_total: CopilotQuotaResponse = serde_json::from_str(json).unwrap();
+        let section = copilot_credits_section(without_total, None);
+        assert_eq!(section.percentage, 0.0);
+        assert_eq!(section.countdown_override.as_deref(), Some("719cr"));
+    }
+
+    #[test]
+    fn civil_from_unix_matches_known_dates() {
+        assert_eq!(civil_from_unix(0), (1970, 1, 1));
+        // 2026-08-12T00:00:00Z
+        assert_eq!(civil_from_unix(1786492800), (2026, 8, 12));
+        // Leap day
+        assert_eq!(civil_from_unix(1709164800), (2024, 2, 29));
+    }
+
+    #[test]
+    fn countdown_override_replaces_the_reset_text() {
+        let strings = crate::localization::LanguageId::English.strings();
+        let section = UsageSection {
+            percentage: 4.3,
+            resets_at: None,
+            countdown_override: Some("$7.35".to_string()),
+        };
+        assert_eq!(format_line(&section, strings), "4% \u{00b7} $7.35");
+    }
+
+    #[test]
+    fn jwt_expiry_reads_exp_claim() {
+        // {"typ":"access","exp":1786548700}
+        let token = "aaa.eyJ0eXAiOiJhY2Nlc3MiLCJleHAiOjE3ODY1NDg3MDB9.bbb";
+        assert_eq!(jwt_expiry(token), Some(1786548700));
+        assert_eq!(jwt_expiry("not-a-jwt"), None);
     }
 
     #[test]

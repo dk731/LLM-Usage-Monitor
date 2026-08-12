@@ -13,6 +13,8 @@ use crate::native_interop::{self, Color, WM_APP_TRAY};
 const CLAUDE_TRAY_ICON_ID: u32 = 1;
 const CODEX_TRAY_ICON_ID: u32 = 2;
 const ANTIGRAVITY_TRAY_ICON_ID: u32 = 3;
+const KIMI_TRAY_ICON_ID: u32 = 4;
+const COPILOT_TRAY_ICON_ID: u32 = 5;
 
 /// Menu item ID for toggling widget visibility (used by window.rs context menu).
 pub const IDM_TOGGLE_WIDGET: u16 = 70;
@@ -29,6 +31,8 @@ pub enum TrayIconKind {
     Claude,
     Codex,
     Antigravity,
+    Kimi,
+    Copilot,
 }
 
 pub struct TrayIconData {
@@ -43,6 +47,8 @@ impl TrayIconKind {
             Self::Claude => CLAUDE_TRAY_ICON_ID,
             Self::Codex => CODEX_TRAY_ICON_ID,
             Self::Antigravity => ANTIGRAVITY_TRAY_ICON_ID,
+            Self::Kimi => KIMI_TRAY_ICON_ID,
+            Self::Copilot => COPILOT_TRAY_ICON_ID,
         }
     }
 }
@@ -101,9 +107,25 @@ fn antigravity_fill(percent: f64) -> Color {
     }
 }
 
+fn copilot_fill(percent: f64) -> Color {
+    if percent >= 90.0 {
+        Color::from_hex("#FFFFFF")
+    } else {
+        Color::from_hex("#1A7F37")
+    }
+}
+
+fn kimi_fill(percent: f64) -> Color {
+    if percent >= 90.0 {
+        Color::from_hex("#FFFFFF")
+    } else {
+        Color::from_hex("#6E56CF")
+    }
+}
+
 /// Create a rounded-rectangle tray icon badge showing the usage percentage.
 /// For Claude, `percent` = None uses the embedded app icon as the loading state.
-/// For Codex and Antigravity, `percent` = None uses a provider placeholder badge.
+/// For the other providers, `percent` = None uses a provider placeholder badge.
 pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
     if matches!(kind, TrayIconKind::Claude) && percent.is_none() {
         let app_icon = load_embedded_app_icon();
@@ -115,7 +137,10 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
     let size = 64_i32;
     let margin = 0_i32;
     let radius = 2_i32;
-    let outline = if matches!(kind, TrayIconKind::Codex | TrayIconKind::Antigravity) {
+    let outline = if matches!(kind, TrayIconKind::Codex
+            | TrayIconKind::Antigravity
+            | TrayIconKind::Kimi
+            | TrayIconKind::Copilot) {
         3_i32
     } else {
         0_i32
@@ -125,6 +150,8 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
         TrayIconKind::Claude => interpolated_fill(percent.unwrap_or(0.0)),
         TrayIconKind::Codex => codex_fill(percent.unwrap_or(0.0)),
         TrayIconKind::Antigravity => antigravity_fill(percent.unwrap_or(0.0)),
+        TrayIconKind::Kimi => kimi_fill(percent.unwrap_or(0.0)),
+        TrayIconKind::Copilot => copilot_fill(percent.unwrap_or(0.0)),
     };
     let text_col = match kind {
         TrayIconKind::Claude => Color::from_hex("#FFFFFF"),
@@ -132,6 +159,10 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
         TrayIconKind::Codex => Color::from_hex("#FFFFFF"),
         TrayIconKind::Antigravity if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#1967D2"),
         TrayIconKind::Antigravity => Color::from_hex("#FFFFFF"),
+        TrayIconKind::Kimi if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#5A43B0"),
+        TrayIconKind::Kimi => Color::from_hex("#FFFFFF"),
+        TrayIconKind::Copilot if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#1A7F37"),
+        TrayIconKind::Copilot => Color::from_hex("#FFFFFF"),
     };
     let outline_col = match kind {
         TrayIconKind::Claude => fill,
@@ -139,6 +170,10 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
         TrayIconKind::Codex => Color::from_hex("#FFFFFF"),
         TrayIconKind::Antigravity if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#1967D2"),
         TrayIconKind::Antigravity => Color::from_hex("#FFFFFF"),
+        TrayIconKind::Kimi if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#5A43B0"),
+        TrayIconKind::Kimi => Color::from_hex("#FFFFFF"),
+        TrayIconKind::Copilot if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#1A7F37"),
+        TrayIconKind::Copilot => Color::from_hex("#FFFFFF"),
     };
 
     let display_text = match percent {
@@ -147,6 +182,8 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
             TrayIconKind::Claude => String::new(),
             TrayIconKind::Codex => "C".to_string(),
             TrayIconKind::Antigravity => "A".to_string(),
+            TrayIconKind::Kimi => "K".to_string(),
+            TrayIconKind::Copilot => "G".to_string(),
         },
     };
 

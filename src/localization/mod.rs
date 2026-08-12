@@ -148,6 +148,7 @@ pub struct Strings {
     pub window_title: &'static str,
     pub refresh: &'static str,
     pub update_frequency: &'static str,
+    pub fifteen_seconds: &'static str,
     pub one_minute: &'static str,
     pub five_minutes: &'static str,
     pub fifteen_minutes: &'static str,
@@ -189,6 +190,16 @@ pub struct Strings {
     pub antigravity_token_expired_body: &'static str,
     pub codex_window_title: &'static str,
     pub antigravity_window_title: &'static str,
+    pub kimi_model: &'static str,
+    pub kimi_window_title: &'static str,
+    pub kimi_token_expired_title: &'static str,
+    pub kimi_token_expired_body: &'static str,
+    pub bar_length: &'static str,
+    pub bar_length_auto: &'static str,
+    pub copilot_model: &'static str,
+    pub copilot_window_title: &'static str,
+    pub copilot_token_expired_title: &'static str,
+    pub copilot_token_expired_body: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {
